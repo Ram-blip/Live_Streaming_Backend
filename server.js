@@ -23,11 +23,10 @@ const Client = require('./classes/Client');
 const Room = require('./classes/Room');
 
 const io = socketio(httpServer, {
-    cors: [
-        'http://localhost:5173',
-        'https://localhost:5173',
-        'http://10.13.15.238:5173/'
-    ]
+    cors: {
+        origin: ['http://localhost:5173', 'https://localhost:5173', 'http://10.13.15.238:5173/'],
+        methods: ['GET', 'POST']
+    }
 });
 
 // Global variables
@@ -45,21 +44,18 @@ io.on('connect', socket => {
     let client;
     const handshake = socket.handshake;
 
-    // New event handler for checking room before joining
     socket.on('checkRoom', async ({username, roomId, isPresenter}, ackCb) => {
         let requestedRoom = rooms.find(room => room.roomName === roomId);
         let canBePresenter = isPresenter;
 
         if (!requestedRoom) {
-            // New room - first user can be presenter if they want
             const workerToUse = await getWorker(workers);
             requestedRoom = new Room(roomId, workerToUse);
             await requestedRoom.createRouter(io);
             rooms.push(requestedRoom);
         } else {
-            // Existing room - check presenter limits
             if (isPresenter && !requestedRoom.canAddPresenter()) {
-                canBePresenter = false; // Override to regular participant
+                canBePresenter = false;
             }
         }
 
@@ -166,36 +162,40 @@ io.on('connect', socket => {
             
             client.addProducer(kind, newProducer);
             
-            if (kind === 'audio') {
+            // Only add audio producers to active speaker list if client is a presenter
+            if (kind === 'audio' && client.isPresenter) {
                 client.room.activeSpeakerList.push(newProducer.id);
             }
             
             ackCb(newProducer.id);
 
-            const newTransportsByPeer = updateActiveSpeakers(client.room, io);
-            
-            for (const [socketId, audioPidsToCreate] of Object.entries(newTransportsByPeer)) {
-                const videoPidsToCreate = audioPidsToCreate.map(aPid => {
-                    const producerClient = client.room.clients.find(c => 
-                        c?.producer?.audio?.id === aPid
-                    );
-                    return producerClient?.producer?.video?.id;
-                });
+            // Update active speakers for audio changes only
+            if (kind === 'audio') {
+                const newTransportsByPeer = updateActiveSpeakers(client.room, io);
+                
+                for (const [socketId, audioPidsToCreate] of Object.entries(newTransportsByPeer)) {
+                    const videoPidsToCreate = audioPidsToCreate.map(aPid => {
+                        const producerClient = client.room.clients.find(c => 
+                            c?.producer?.audio?.id === aPid
+                        );
+                        return producerClient?.producer?.video?.id;
+                    });
 
-                const associatedUserNames = audioPidsToCreate.map(aPid => {
-                    const producerClient = client.room.clients.find(c => 
-                        c?.producer?.audio?.id === aPid
-                    );
-                    return producerClient?.userName;
-                });
+                    const associatedUserNames = audioPidsToCreate.map(aPid => {
+                        const producerClient = client.room.clients.find(c => 
+                            c?.producer?.audio?.id === aPid
+                        );
+                        return producerClient?.userName;
+                    });
 
-                io.to(socketId).emit('newProducersToConsume', {
-                    routerRtpCapabilities: client.room.router.rtpCapabilities,
-                    audioPidsToCreate,
-                    videoPidsToCreate,
-                    associatedUserNames,
-                    activeSpeakerList: client.room.activeSpeakerList.slice(0, 5)
-                });
+                    io.to(socketId).emit('newProducersToConsume', {
+                        routerRtpCapabilities: client.room.router.rtpCapabilities,
+                        audioPidsToCreate,
+                        videoPidsToCreate,
+                        associatedUserNames,
+                        activeSpeakerList: client.room.activeSpeakerList.slice(0, 5)
+                    });
+                }
             }
         } catch (error) {
             console.log(error);
@@ -252,7 +252,9 @@ io.on('connect', socket => {
             t?.[kind]?.producerId === pid
         );
 
-        await consumerToResume[kind].resume();
+        if (consumerToResume?.[kind]?.resume) {
+            await consumerToResume[kind].resume();
+        }
 
         if (typeof ackCb === 'function') {
             ackCb();
@@ -277,10 +279,10 @@ io.on('connect', socket => {
                 if (roomIndex > -1) {
                     rooms.splice(roomIndex, 1);
                 }
+            } else {
+                // Update active speakers for remaining clients
+                updateActiveSpeakers(client.room, io);
             }
-
-            // Update active speakers for remaining clients
-            updateActiveSpeakers(client.room, io);
         }
     });
 });

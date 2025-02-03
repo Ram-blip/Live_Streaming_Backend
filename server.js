@@ -1,242 +1,290 @@
-const fs = require('fs') //we need this to read our keys. Part of node
-const https = require('https') //we need this for a secure express server. part of node
-const http = require('http')
+const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const express = require('express');
+const app = express();
+app.use(express.static('public'));
 
-//express sets up the http server and serves our front end
-const express = require('express')
-const app = express()
-//seve everything in public statically
-app.use(express.static('public'))
+// For HTTPS setup (commented out for development)
+// const key = fs.readFileSync('./config/create-cert-key.pem');
+// const cert = fs.readFileSync('./config/create-cert.pem');
+// const options = {key, cert};
+// const httpsServer = https.createServer(options, app);
+const httpServer = http.createServer(app);
 
-//get the keys we made with mkcert
-const key = fs.readFileSync('./config/create-cert-key.pem')
-const cert = fs.readFileSync('./config/create-cert.pem')
-const options = {key,cert}
-//use those keys with the https module to have https
-// const httpsServer = https.createServer(options, app)
-const httpServer = http.createServer(app)
+const socketio = require('socket.io');
+const mediasoup = require('mediasoup');
 
+const config = require('./config/config');
+const createWorkers = require('./utilities/createWorkers');
+const getWorker = require('./utilities/getWorker');
+const updateActiveSpeakers = require('./utilities/updateActiveSpeakers');
+const Client = require('./classes/Client');
+const Room = require('./classes/Room');
 
-const socketio = require('socket.io')
-const mediasoup = require('mediasoup')
+const io = socketio(httpServer, {
+    cors: [
+        'http://localhost:5173',
+        'https://localhost:5173',
+        'http://10.13.15.238:5173/'
+    ]
+});
 
-const config = require('./config/config')
-const createWorkers = require('./utilities/createWorkers')
-const getWorker = require('./utilities/getWorker')
-const updateActiveSpeakers = require('./utilities/updateActiveSpeakers')
-const Client = require('./classes/Client')
-const Room = require('./classes/Room')
+// Global variables
+let workers = null;
+const rooms = [];
 
+// Initialize MediaSoup workers
+const initMediaSoup = async () => {
+    workers = await createWorkers();
+};
 
-//set up the socketio server, listening by way of our express https sever
-const io = socketio(httpServer,{
-    cors: [`https://localhost:5173`],
-    cors: [`http://localhost:5173`],
-    cors: [`http://10.13.15.238:5173/`],
-})
+initMediaSoup();
 
-//our globals
-//init workers, it's where our mediasoup workers will live
-let workers = null
-// master rooms array that contains all our rooms 
-const rooms = []
+io.on('connect', socket => {
+    let client;
+    const handshake = socket.handshake;
 
+    // New event handler for checking room before joining
+    socket.on('checkRoom', async ({username, roomId, isPresenter}, ackCb) => {
+        let requestedRoom = rooms.find(room => room.roomName === roomId);
+        let canBePresenter = isPresenter;
 
-
-//initMediaSoup gets mediasoup ready to do its thing
-const initMediaSoup = async()=>{
-    workers = await createWorkers()
-}
-
-initMediaSoup() //build our mediasoup server/sfu
-
-// socketIo listeners
-io.on('connect', socket=>{
-    // this is where this client/user/socket lives! 
-    let client; // this client object is available to all the socket listeners below
-    const handshake = socket.handshake // this is where auth and query lives
-    // you could now check handshake for Password, auth, etc
-    socket.on('joinRoom',async ({userName, roomName}, ackCb)=>{
-        let newRoom = false
-        client = new Client(userName, socket)
-        let requestedRoom = rooms.find(room=> room.roomName === roomName)
-        if(!requestedRoom){
-            newRoom = true
-            // make the new room, add a worker and add a new router to it
-            const workerToUse = await getWorker(workers)
-            requestedRoom = new Room(roomName, workerToUse)
-            await requestedRoom.createRouter(io)
-            rooms.push(requestedRoom)
+        if (!requestedRoom) {
+            // New room - first user can be presenter if they want
+            const workerToUse = await getWorker(workers);
+            requestedRoom = new Room(roomId, workerToUse);
+            await requestedRoom.createRouter(io);
+            rooms.push(requestedRoom);
+        } else {
+            // Existing room - check presenter limits
+            if (isPresenter && !requestedRoom.canAddPresenter()) {
+                canBePresenter = false; // Override to regular participant
+            }
         }
-        // add the room to the client 
-        client.room = requestedRoom
-        // add the client to the Room clients
-        client.room.addClient(client)
-        // add this socket to the socket room
-        socket.join(client.room.roomName)
 
-        const audioPidsToCreate = client.room.activeSpeakerList.slice(0,5) // fetch the first 0-5 pids in the activespeaker list
-        const videoPidsToCreate = audioPidsToCreate.map(aid=>{
-            const producingClient = client.room.clients.find(c=> c?.producer?.audio?.id === aid)
-            return producingClient?.producer?.video?.id
-        })
+        ackCb({
+            success: true,
+            isPresenter: canBePresenter,
+            message: canBePresenter === isPresenter ? 
+                'Joining room' : 
+                'Joining as participant (presenter limit reached)'
+        });
+    });
 
-        const associatedUserNames = audioPidsToCreate.map(aid=>{
-            const producingClient = client.room.clients.find(c=> c?.producer?.audio?.id === aid)
-            return producingClient?.userName
-        })
+    socket.on('joinRoom', async ({username, roomId, isPresenter}, ackCb) => {
+        let newRoom = false;
+        client = new Client(username, socket);
+        client.isPresenter = isPresenter;
+
+        let requestedRoom = rooms.find(room => room.roomName === roomId);
         
+        if (!requestedRoom) {
+            newRoom = true;
+            const workerToUse = await getWorker(workers);
+            requestedRoom = new Room(roomId, workerToUse);
+            await requestedRoom.createRouter(io);
+            rooms.push(requestedRoom);
+        }
+
+        if (isPresenter) {
+            requestedRoom.addPresenter(socket.id);
+        }
+
+        client.room = requestedRoom;
+        client.room.addClient(client);
+        socket.join(client.room.roomName);
+
+        const audioPidsToCreate = client.room.activeSpeakerList.slice(0, 5);
+        const videoPidsToCreate = audioPidsToCreate.map(aid => {
+            const producingClient = client.room.clients.find(c => 
+                c?.producer?.audio?.id === aid
+            );
+            return producingClient?.producer?.video?.id;
+        });
+
+        const associatedUserNames = audioPidsToCreate.map(aid => {
+            const producingClient = client.room.clients.find(c => 
+                c?.producer?.audio?.id === aid
+            );
+            return producingClient?.userName;
+        });
+
         ackCb({
             routerRtpCapabilities: client.room.router.rtpCapabilities,
             newRoom,
             audioPidsToCreate,
             videoPidsToCreate,
-            associatedUserNames
-        })
-    })
+            associatedUserNames,
+            isPresenter: client.isPresenter
+        });
+    });
 
-    socket.on('requestTransport', async ({type,audioPid},ackCb)=>{
-        // whether producer or consumer, client needs the parameters    
-        let clientTransportParams 
-        if(type === 'producer'){
-            clientTransportParams = await client.addTransport(type)
-        } else if(type === 'consumer'){
-            // we have 1 transport per client we are streaming from 
-            // Each transport will have an audio and video producer/ consumer
-            // we know the audio pid, because it came from the dominant speaker
-            const producingClient = client.room.clients.find(c=> c?.producer?.audio?.id === audioPid)
-            const videoPid = producingClient?.producer?.video?.id
-            clientTransportParams = await client.addTransport(type,audioPid,videoPid)
-        } 
-        ackCb(clientTransportParams)
+    socket.on('requestTransport', async ({type, audioPid}, ackCb) => {
+        let clientTransportParams;
+        if (type === 'producer') {
+            clientTransportParams = await client.addTransport(type);
+        } else if (type === 'consumer') {
+            const producingClient = client.room.clients.find(c => 
+                c?.producer?.audio?.id === audioPid
+            );
+            const videoPid = producingClient?.producer?.video?.id;
+            clientTransportParams = await client.addTransport(type, audioPid, videoPid);
+        }
+        ackCb(clientTransportParams);
+    });
 
-    })
-
-    socket.on('connectTransport', async ({dtlsParameters, type, audioPid}, ackCb)=>{
-        if(type === 'producer'){
-            try{
-                await client.upstreamTransport.connect({dtlsParameters})
-                ackCb('success')
-            }catch(error){
-                console.log(error)
-                ackCb('error')
+    socket.on('connectTransport', async ({dtlsParameters, type, audioPid}, ackCb) => {
+        if (type === 'producer') {
+            try {
+                await client.upstreamTransport.connect({dtlsParameters});
+                ackCb('success');
+            } catch (error) {
+                console.log(error);
+                ackCb('error');
             }
-        } else if(type === 'consumer'){
-            // find the right transport, for this consumer
-            try{
-                const downStreamTransports = client.downStreamTransports.find(t=> { return t.associatedAudioPid === audioPid})
-                await downStreamTransports.transport.connect({dtlsParameters})
-                ackCb('success')
-            }
-            catch(error){
-                console.log(error)
-                ackCb('error')
+        } else if (type === 'consumer') {
+            try {
+                const downStreamTransports = client.downStreamTransports.find(t => 
+                    t.associatedAudioPid === audioPid
+                );
+                await downStreamTransports.transport.connect({dtlsParameters});
+                ackCb('success');
+            } catch (error) {
+                console.log(error);
+                ackCb('error');
             }
         }
-    })
-    socket.on('startProducing', async ({kind, rtpParameters}, ackCb)=>{  
-        // create a producer with the rtpParameters which we sent
-        
-        try{
-            const newProducer = await client.upstreamTransport.produce({kind, rtpParameters})
-            // add the producer to this client object
-            client.addProducer(kind, newProducer)
-            // the front end is waiting for the ack here
-            if(kind === 'audio'){
-                client.room.activeSpeakerList.push(newProducer.id)
-            }
-            ackCb(newProducer.id)
-        }catch(error){ 
-            console.log(error)
-            ackCb('error')
-        }
-        
-        // placeholder 1 if this is an audio producer, add it to the speaker
-        // placeholder 2 if this room is populated, then let the connectd peers know 
-        // run updateActiveSpeakers
-        const newTransportsByPeer = updateActiveSpeakers(client.room,io)
-        // newTransportsByPeer is an object with the socket id as the key and an array of pids to consume as the value
-        for(const [socketId, audioPidsToCreate] of Object.entries(newTransportsByPeer)){
-            // we have the audioPidsToCreate for this socket id
-            // map the video pids and the username
-            const videoPidsToCreate = audioPidsToCreate.map(aPid =>{
-                const producerClient = client.room.clients.find(c=>c?.producer?.audio?.id === aPid)
-                return producerClient?.producer?.video?.id
-            })
+    });
 
-            const associatedUserNames = audioPidsToCreate.map(aPid =>{
-                const producerClient = client.room.clients.find(c=>c?.producer?.audio?.id === aPid)
-                return producerClient?.userName
-            })
-            io.to(socketId).emit('newProducersToConsume',{
-                routerRtpCapabilities: client.room.router.rtpCapabilities,
-                audioPidsToCreate,
-                videoPidsToCreate,
-                associatedUserNames,
-                activeSpeakerList : client.room.activeSpeakerList.slice(0,5)
-            })
+    socket.on('startProducing', async ({kind, rtpParameters}, ackCb) => {
+        try {
+            const newProducer = await client.upstreamTransport.produce({
+                kind,
+                rtpParameters
+            });
+            
+            client.addProducer(kind, newProducer);
+            
+            if (kind === 'audio') {
+                client.room.activeSpeakerList.push(newProducer.id);
+            }
+            
+            ackCb(newProducer.id);
+
+            const newTransportsByPeer = updateActiveSpeakers(client.room, io);
+            
+            for (const [socketId, audioPidsToCreate] of Object.entries(newTransportsByPeer)) {
+                const videoPidsToCreate = audioPidsToCreate.map(aPid => {
+                    const producerClient = client.room.clients.find(c => 
+                        c?.producer?.audio?.id === aPid
+                    );
+                    return producerClient?.producer?.video?.id;
+                });
+
+                const associatedUserNames = audioPidsToCreate.map(aPid => {
+                    const producerClient = client.room.clients.find(c => 
+                        c?.producer?.audio?.id === aPid
+                    );
+                    return producerClient?.userName;
+                });
+
+                io.to(socketId).emit('newProducersToConsume', {
+                    routerRtpCapabilities: client.room.router.rtpCapabilities,
+                    audioPidsToCreate,
+                    videoPidsToCreate,
+                    associatedUserNames,
+                    activeSpeakerList: client.room.activeSpeakerList.slice(0, 5)
+                });
+            }
+        } catch (error) {
+            console.log(error);
+            ackCb('error');
         }
-    })
+    });
 
     socket.on('audioChange', typeOfChange => {
-        if(typeOfChange === 'mute'){
-            client?.producer?.audio?.pause()
-        }else{
-            client?.producer?.audio?.resume()
+        if (typeOfChange === 'mute') {
+            client?.producer?.audio?.pause();
+        } else {
+            client?.producer?.audio?.resume();
         }
-    })
+    });
 
-    socket.on('consumeMedia', async({rtpCapabilities, pid, kind}, ackCb)=>{
-        // will run twice for every peer to consume, once for video and once for audio
-        console.log("kind:", kind, "pid:", pid) 
-        try{
-            if(!client.room.router.canConsume({producerId: pid, rtpCapabilities})){
-                ackCb("cannotConsume")
-            }else {
-                // we can consume!
-                const downStreamTransports = client.downStreamTransports.find(t=>{
-                    if(kind=== 'audio'){
-                        return t.associatedAudioPid === pid
-                    } else if(kind === 'video'){
-                        return t.associatedVideoPid === pid
+    socket.on('consumeMedia', async ({rtpCapabilities, pid, kind}, ackCb) => {
+        try {
+            if (!client.room.router.canConsume({producerId: pid, rtpCapabilities})) {
+                ackCb('cannotConsume');
+            } else {
+                const downStreamTransports = client.downStreamTransports.find(t => {
+                    if (kind === 'audio') {
+                        return t.associatedAudioPid === pid;
+                    } else if (kind === 'video') {
+                        return t.associatedVideoPid === pid;
                     }
-                }) 
-                // create the consumer with the transport
+                });
+
                 const newConsumer = await downStreamTransports.transport.consume({
                     producerId: pid,
                     rtpCapabilities,
-                    paused: true // good to pause it initially, let the client decide when to play
-                })
-                client.addConsumer(kind, newConsumer, downStreamTransports)
+                    paused: true
+                });
+
+                client.addConsumer(kind, newConsumer, downStreamTransports);
+
                 const clientParams = {
                     producerId: pid,
                     id: newConsumer.id,
                     kind: newConsumer.kind,
                     rtpParameters: newConsumer.rtpParameters
-                }
-                ackCb(clientParams)
-            }
-        }catch(err){
-            console.log(err)
-            ackCb('consumeFailed')
-        }
-    })
+                };
 
-    socket.on('unpauseConsumer', async (data, ackCb) => {
-        const { pid, kind } = data;  // Extract values properly
-    
-        const consumerToResume = client.downStreamTransports.find(t => {
-            return t?.[kind]?.producerId === pid;
-        });
-    
-        await consumerToResume[kind].resume();
-    
-        if (typeof ackCb === "function") {
-            ackCb();  // Send acknowledgment back to the client
+                ackCb(clientParams);
+            }
+        } catch (err) {
+            console.log(err);
+            ackCb('consumeFailed');
         }
     });
-    
 
-})
+    socket.on('unpauseConsumer', async ({pid, kind}, ackCb) => {
+        const consumerToResume = client.downStreamTransports.find(t => 
+            t?.[kind]?.producerId === pid
+        );
 
-httpServer.listen(config.port)
+        await consumerToResume[kind].resume();
+
+        if (typeof ackCb === 'function') {
+            ackCb();
+        }
+    });
+
+    // Handle disconnection
+    socket.on('disconnect', () => {
+        if (client?.room) {
+            // Remove presenter status if they were a presenter
+            client.room.removePresenter(socket.id);
+            
+            // Remove client from room
+            const index = client.room.clients.findIndex(c => c.socket.id === socket.id);
+            if (index > -1) {
+                client.room.clients.splice(index, 1);
+            }
+
+            // Clean up room if empty
+            if (client.room.clients.length === 0) {
+                const roomIndex = rooms.findIndex(r => r.roomName === client.room.roomName);
+                if (roomIndex > -1) {
+                    rooms.splice(roomIndex, 1);
+                }
+            }
+
+            // Update active speakers for remaining clients
+            updateActiveSpeakers(client.room, io);
+        }
+    });
+});
+
+httpServer.listen(config.port, () => {
+    console.log(`Server is running on port ${config.port}`);
+});

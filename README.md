@@ -1,6 +1,3 @@
-
-
-# ActiveSpeaker and Video Conferencing with Mediasoup backend
 ## Overview
 This is the **backend** for the video conferencing project using **Mediasoup**. It handles WebRTC media routing, socket signaling, room management, and real-time communication. Built with **Node.js, Express.js, and Socket.IO**, it ensures a scalable and efficient backend infrastructure for many-to-many video conferencing.
 
